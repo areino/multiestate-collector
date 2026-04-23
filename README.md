@@ -1,8 +1,8 @@
-# Multiestate Collector
+# Sophos to Taegis Multiestate Collector
 
 Middleware-style collector: **many Sophos Central SIEM estates** → **one Taegis XDR tenant** via JSONL batches and the [Taegis File Upload API](https://docs.taegis.secureworks.com/apis/using_file_upload_api/).
 
-Everything ships as a **single Python script**: `multiestate_collector.py` (plus `examples/config.json`, `requirements.txt`, and tests).
+Everything ships as a **single Python script**: `multiestate_collector.py` (plus `config.json`, `requirements.txt`).
 
 References: [Sophos SIEM events](https://developer.sophos.com/docs/siem-v1/1/routes/events/get), [Taegis rate limits](https://docs.taegis.secureworks.com/apis/using_xdr_apis/).
 
@@ -18,11 +18,8 @@ References: [Sophos SIEM events](https://developer.sophos.com/docs/siem-v1/1/rou
 ## Run
 
 ```bash
-cd C:\git\multiestate-collector
-python -m venv .venv
-.venv\Scripts\activate
 pip install -r requirements.txt
-python multiestate_collector.py --config examples\config.json --once
+python multiestate_collector.py --config config.json --once
 ```
 
 Daemon mode (sleeps `poll_interval_seconds` from JSON between cycles):
