@@ -376,6 +376,14 @@ class ObservabilityConfig(BaseModel):
     summary_interval_seconds: float = Field(default=900.0, ge=60.0)
 
 
+class S3PersistenceConfig(BaseModel):
+    """When using --lambda or lambda_handler(), state + spool live under this bucket."""
+
+    bucket: str
+    prefix: str = Field(default="multiestate/", description="Key prefix; trailing slash recommended.")
+    region: str | None = Field(default=None, description="AWS region; defaults from env / Lambda runtime.")
+
+
 class CollectorConfig(BaseModel):
     sophos_estates: list[SophosEstateConfig]
     poll_interval_seconds: float = Field(default=3600.0, ge=10.0)
@@ -389,6 +397,10 @@ class CollectorConfig(BaseModel):
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
     state_dir: str = Field(default="./var/state")
     spool_dir: str = Field(default="./var/spool")
+    s3: S3PersistenceConfig | None = Field(
+        default=None,
+        description="Required for --lambda / AWS Lambda: S3 bucket for cursors, breakers, health, and spool batches.",
+    )
     circuit_breaker: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -540,12 +552,297 @@ class StateStore:
             encoding="utf-8",
         )
 
+    def read_health_raw(self) -> dict[str, Any]:
+        hp = self.state_dir / "health.json"
+        if not hp.exists():
+            return {}
+        try:
+            return json.loads(hp.read_text(encoding="utf-8"))
+        except OSError:
+            return {}
 
-def spool_queue_depth(spool_dir: Path) -> int:
-    spool_dir = Path(spool_dir)
-    if not spool_dir.exists():
-        return 0
-    return sum(1 for p in spool_dir.iterdir() if p.is_file() and not p.name.startswith("."))
+
+class FileSpoolBackend:
+    """Writes spool files under a local directory."""
+
+    def __init__(self, spool_dir: Path) -> None:
+        self.spool_dir = Path(spool_dir)
+
+    def write_batch(self, filename: str, body: str) -> str:
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        path = self.spool_dir / filename
+        path.write_text(body, encoding="utf-8")
+        return str(path.resolve())
+
+    def iter_pending_uploads(self) -> list[tuple[str, bytes]]:
+        if not self.spool_dir.exists():
+            return []
+        out: list[tuple[str, bytes]] = []
+        for p in sorted(self.spool_dir.iterdir()):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            if p.suffix not in {".log", ".jsonl", ".txt"}:
+                continue
+            out.append((str(p.resolve()), p.read_bytes()))
+        return out
+
+    def remove(self, handle: str) -> None:
+        Path(handle).unlink(missing_ok=True)
+
+    def depth(self) -> int:
+        if not self.spool_dir.exists():
+            return 0
+        return sum(
+            1
+            for p in self.spool_dir.iterdir()
+            if p.is_file() and not p.name.startswith(".") and p.suffix in {".log", ".jsonl", ".txt"}
+        )
+
+
+def _normalize_s3_prefix(prefix: str) -> str:
+    p = prefix.strip().strip("/")
+    return f"{p}/" if p else ""
+
+
+class AsyncFileStateStore:
+    """Async façade over disk `StateStore` (small JSON; direct sync I/O)."""
+
+    def __init__(self, inner: StateStore) -> None:
+        self._inner = inner
+
+    @property
+    def state_dir(self) -> Path:
+        return self._inner.state_dir
+
+    async def load_cursor(self, estate_key: str) -> CursorState:
+        return self._inner.load_cursor(estate_key)
+
+    async def save_cursor(self, estate_key: str, cursor: CursorState) -> None:
+        self._inner.save_cursor(estate_key, cursor)
+
+    async def load_breaker(self, estate_key: str) -> CircuitBreakerSnapshot | None:
+        return self._inner.load_breaker(estate_key)
+
+    async def save_breaker(self, estate_key: str, snap: CircuitBreakerSnapshot) -> None:
+        self._inner.save_breaker(estate_key, snap)
+
+    async def write_health(self, health: HealthState) -> None:
+        self._inner.write_health(health)
+
+    async def read_health_raw(self) -> dict[str, Any]:
+        return self._inner.read_health_raw()
+
+
+class S3AsyncStateStore:
+    """Cursors, breakers, and health.json in S3."""
+
+    def __init__(self, s3cfg: S3PersistenceConfig) -> None:
+        import boto3
+
+        self._prefix = _normalize_s3_prefix(s3cfg.prefix)
+        self._bucket = s3cfg.bucket
+        kwargs: dict[str, Any] = {}
+        if s3cfg.region:
+            kwargs["region_name"] = s3cfg.region
+        self._client = boto3.client("s3", **kwargs)
+
+    @property
+    def state_dir(self) -> Path:
+        """Synthetic path for logging only."""
+        return Path(f"s3://{self._bucket}/{self._prefix}state")
+
+    def _key(self, *parts: str) -> str:
+        return self._prefix + "/".join(parts)
+
+    async def load_cursor(self, estate_key: str) -> CursorState:
+        key = self._key("state", "cursors", f"{safe_filename_component(estate_key)}.json")
+
+        def _load() -> CursorState:
+            from botocore.exceptions import ClientError
+
+            try:
+                body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+                data = json.loads(body.decode())
+                return CursorState(
+                    next_cursor=data.get("next_cursor"),
+                    last_cursor_saved_at=data.get("last_cursor_saved_at"),
+                    last_event_seen_at=data.get("last_event_seen_at"),
+                )
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    return CursorState()
+                raise
+
+        return await asyncio.to_thread(_load)
+
+    async def save_cursor(self, estate_key: str, cursor: CursorState) -> None:
+        key = self._key("state", "cursors", f"{safe_filename_component(estate_key)}.json")
+        body = json.dumps(asdict(cursor), indent=2).encode("utf-8")
+
+        def _put() -> None:
+            self._client.put_object(Bucket=self._bucket, Key=key, Body=body, ContentType="application/json")
+
+        await asyncio.to_thread(_put)
+
+    async def load_breaker(self, estate_key: str) -> CircuitBreakerSnapshot | None:
+        key = self._key("state", "breakers", f"{safe_filename_component(estate_key)}.json")
+
+        def _load() -> CircuitBreakerSnapshot | None:
+            from botocore.exceptions import ClientError
+
+            try:
+                body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+                data = json.loads(body.decode())
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    return None
+                raise
+            st = data.get("state", "CLOSED")
+            try:
+                state = BreakerState(st)
+            except ValueError:
+                state = BreakerState.CLOSED
+            return CircuitBreakerSnapshot(
+                state=state,
+                failure_count=int(data.get("failure_count", 0)),
+                window_failures=int(data.get("window_failures", 0)),
+                last_failure_at=data.get("last_failure_at"),
+                opened_at=data.get("opened_at"),
+                next_attempt_at=data.get("next_attempt_at"),
+                reason=data.get("reason"),
+                half_open_calls=int(data.get("half_open_calls", 0)),
+                half_open_successes=int(data.get("half_open_successes", 0)),
+                consecutive_open_count=int(data.get("consecutive_open_count", 0)),
+            )
+
+        return await asyncio.to_thread(_load)
+
+    async def save_breaker(self, estate_key: str, snap: CircuitBreakerSnapshot) -> None:
+        key = self._key("state", "breakers", f"{safe_filename_component(estate_key)}.json")
+        payload = asdict(snap)
+        payload["state"] = snap.state.value
+        body = json.dumps(payload, indent=2).encode("utf-8")
+
+        def _put() -> None:
+            self._client.put_object(Bucket=self._bucket, Key=key, Body=body, ContentType="application/json")
+
+        await asyncio.to_thread(_put)
+
+    async def write_health(self, health: HealthState) -> None:
+        key = self._key("state", "health.json")
+        raw = json.dumps(
+            {
+                "last_successful_sophos_pull": health.last_successful_sophos_pull,
+                "last_successful_taegis_upload": health.last_successful_taegis_upload,
+                "spool_depth": health.spool_depth,
+            },
+            indent=2,
+        ).encode("utf-8")
+
+        def _put() -> None:
+            self._client.put_object(Bucket=self._bucket, Key=key, Body=raw, ContentType="application/json")
+
+        await asyncio.to_thread(_put)
+
+    async def read_health_raw(self) -> dict[str, Any]:
+        key = self._key("state", "health.json")
+
+        def _read() -> dict[str, Any]:
+            from botocore.exceptions import ClientError
+
+            try:
+                body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+                return json.loads(body.decode())
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    return {}
+                raise
+
+        return await asyncio.to_thread(_read)
+
+
+class AsyncFileSpool:
+    def __init__(self, inner: FileSpoolBackend) -> None:
+        self._inner = inner
+
+    async def write_batch(self, filename: str, body: str) -> str:
+        return self._inner.write_batch(filename, body)
+
+    async def iter_pending_uploads(self) -> list[tuple[str, bytes]]:
+        return self._inner.iter_pending_uploads()
+
+    async def remove(self, handle: str) -> None:
+        self._inner.remove(handle)
+
+    async def depth(self) -> int:
+        return self._inner.depth()
+
+
+class S3AsyncSpool:
+    def __init__(self, s3cfg: S3PersistenceConfig) -> None:
+        import boto3
+
+        self._prefix = _normalize_s3_prefix(s3cfg.prefix) + "spool/"
+        self._bucket = s3cfg.bucket
+        kwargs: dict[str, Any] = {}
+        if s3cfg.region:
+            kwargs["region_name"] = s3cfg.region
+        self._client = boto3.client("s3", **kwargs)
+
+    async def write_batch(self, filename: str, body: str) -> str:
+        key = self._prefix + filename
+        raw = body.encode("utf-8")
+
+        def _put() -> None:
+            self._client.put_object(Bucket=self._bucket, Key=key, Body=raw, ContentType="text/plain; charset=utf-8")
+
+        await asyncio.to_thread(_put)
+        return key
+
+    async def iter_pending_uploads(self) -> list[tuple[str, bytes]]:
+        def _list_and_fetch() -> list[tuple[str, bytes]]:
+            out: list[tuple[str, bytes]] = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+                for obj in page.get("Contents") or []:
+                    k = obj["Key"]
+                    if k.endswith("/"):
+                        continue
+                    body = self._client.get_object(Bucket=self._bucket, Key=k)["Body"].read()
+                    out.append((k, body))
+            out.sort(key=lambda x: x[0])
+            return out
+
+        return await asyncio.to_thread(_list_and_fetch)
+
+    async def remove(self, handle: str) -> None:
+        def _del() -> None:
+            self._client.delete_object(Bucket=self._bucket, Key=handle)
+
+        await asyncio.to_thread(_del)
+
+    async def depth(self) -> int:
+        def _count() -> int:
+            n = 0
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+                for obj in page.get("Contents") or []:
+                    if not obj["Key"].endswith("/"):
+                        n += 1
+            return n
+
+        return await asyncio.to_thread(_count)
+
+
+def build_async_persistence(cfg: CollectorConfig, *, use_s3: bool) -> tuple[AsyncFileStateStore | S3AsyncStateStore, AsyncFileSpool | S3AsyncSpool]:
+    if use_s3:
+        if cfg.s3 is None:
+            raise ValueError("Config must include an `s3` object with `bucket` when using --lambda or lambda_handler().")
+        return S3AsyncStateStore(cfg.s3), S3AsyncSpool(cfg.s3)
+    return AsyncFileStateStore(StateStore(Path(cfg.state_dir))), AsyncFileSpool(FileSpoolBackend(Path(cfg.spool_dir)))
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +856,7 @@ def _event_size_bytes(obj: dict[str, Any]) -> int:
 
 @dataclass
 class JsonlBatcher:
-    spool_dir: Path
+    spool: AsyncFileSpool | S3AsyncSpool
     cfg: BatchingConfig
     events: list[dict[str, Any]] = field(default_factory=list)
     buffer_bytes: int = 0
@@ -577,35 +874,32 @@ class JsonlBatcher:
             return True
         return False
 
-    def add(self, obj: dict[str, Any]) -> list[Path]:
-        written: list[Path] = []
+    async def add(self, obj: dict[str, Any]) -> list[str]:
+        written: list[str] = []
         if self._should_flush(obj):
-            written.extend(self.flush())
+            written.extend(await self.flush())
         self.events.append(obj)
         self.buffer_bytes += _event_size_bytes(obj)
         if self._should_flush(None):
-            written.extend(self.flush())
+            written.extend(await self.flush())
         return written
 
-    def extend(self, objs: Iterable[dict[str, Any]]) -> list[Path]:
-        written: list[Path] = []
+    async def extend(self, objs: Iterable[dict[str, Any]]) -> list[str]:
+        written: list[str] = []
         for o in objs:
-            written.extend(self.add(o))
+            written.extend(await self.add(o))
         return written
 
-    def flush(self) -> list[Path]:
+    async def flush(self) -> list[str]:
         if not self.events:
             return []
-        self.spool_dir.mkdir(parents=True, exist_ok=True)
-        # Use .log extension: File Upload API expects plain-text logs; .jsonl can trigger presign 400 on some stacks.
         name = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"_{uuid.uuid4().hex}.log"
-        path = self.spool_dir / name
         body = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in self.events) + "\n"
-        path.write_text(body, encoding="utf-8")
         self.events.clear()
         self.buffer_bytes = 0
         self.started_at = time.time()
-        return [path]
+        handle = await self.spool.write_batch(name, body)
+        return [handle]
 
 
 # ---------------------------------------------------------------------------
@@ -810,11 +1104,14 @@ class TaegisClient:
 
     async def upload_file(self, path: Path, client: httpx.AsyncClient) -> None:
         raw = Path(path).read_bytes()
+        await self.upload_payload(Path(path).name, raw, client)
+
+    async def upload_payload(self, file_name: str, raw: bytes, client: httpx.AsyncClient) -> None:
         if len(raw) < MIN_UPLOAD_BYTES:
             raw = raw + (b"\n" * (MIN_UPLOAD_BYTES - len(raw)))
         signer = f"{self._endpoint()}{self.cfg.s3_signer_path}"
         params: dict[str, str] = {
-            "file_name": Path(path).name,
+            "file_name": file_name,
             "content_length": str(len(raw)),
         }
         if self.cfg.service:
@@ -871,14 +1168,9 @@ def _iso_utc(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
-def _read_health_raw(store: StateStore) -> dict[str, Any]:
-    hp = store.state_dir / "health.json"
-    if not hp.exists():
-        return {}
-    try:
-        return json.loads(hp.read_text(encoding="utf-8"))
-    except OSError:
-        return {}
+def _taegis_basename(handle: str) -> str:
+    """Basename for Taegis presign (local path or S3 object key)."""
+    return Path(handle.replace("\\", "/")).name
 
 
 def _enrich_event(raw: Any, estate_name: str, estate_tenant_id: str, pulled_at: str) -> dict[str, Any]:
@@ -897,7 +1189,7 @@ async def _poll_single_estate(
     *,
     cfg: CollectorConfig,
     sophos: SophosClient,
-    store: StateStore,
+    store: AsyncFileStateStore | S3AsyncStateStore,
     breaker_cfg: CircuitBreakerConfig,
     http: httpx.AsyncClient,
     log: logging.Logger,
@@ -915,7 +1207,7 @@ async def _poll_single_estate(
     t0 = time.perf_counter()
     pulled_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    snap = store.load_breaker(estate_key)
+    snap = await store.load_breaker(estate_key)
     breaker = EstateCircuitBreaker(breaker_cfg, snap)
     allowed, trans = breaker.allow_call(utc_now_ts())
     for tr in trans:
@@ -942,11 +1234,11 @@ async def _poll_single_estate(
             next_attempt_at=_iso_utc(breaker.snapshot().next_attempt_at),
             state=breaker.snapshot().state.value,
         )
-        store.save_breaker(estate_key, breaker.snapshot())
+        await store.save_breaker(estate_key, breaker.snapshot())
         stats["duration_seconds"] = time.perf_counter() - t0
         return [], stats
 
-    cursor_state = store.load_cursor(estate_key)
+    cursor_state = await store.load_cursor(estate_key)
     collected: list[dict[str, Any]] = []
     cursor = cursor_state.next_cursor
     pages = 0
@@ -1001,7 +1293,7 @@ async def _poll_single_estate(
                         from_state=tr[1].value,
                         to_state=tr[2].value,
                     )
-                store.save_breaker(estate_key, breaker.snapshot())
+                await store.save_breaker(estate_key, breaker.snapshot())
                 stats["duration_seconds"] = time.perf_counter() - t0
                 slog(
                     log,
@@ -1022,7 +1314,7 @@ async def _poll_single_estate(
 
             cursor_state.next_cursor = page.next_cursor if page.has_more else None
             cursor_state.last_cursor_saved_at = utc_now_ts()
-            store.save_cursor(estate_key, cursor_state)
+            await store.save_cursor(estate_key, cursor_state)
 
             if not page.has_more or not page.next_cursor:
                 poll_finished = True
@@ -1045,9 +1337,9 @@ async def _poll_single_estate(
                     from_state=tr[1].value,
                     to_state=tr[2].value,
                 )
-            store.save_breaker(estate_key, breaker.snapshot())
+            await store.save_breaker(estate_key, breaker.snapshot())
         stats["duration_seconds"] = time.perf_counter() - t0
-        store.save_breaker(estate_key, breaker.snapshot())
+        await store.save_breaker(estate_key, breaker.snapshot())
 
     slog(
         log,
@@ -1067,43 +1359,42 @@ async def _upload_spool(
     cfg: CollectorConfig,
     taegis: TaegisClient,
     http: httpx.AsyncClient,
-    store: StateStore,
+    store: AsyncFileStateStore | S3AsyncStateStore,
+    spool: AsyncFileSpool | S3AsyncSpool,
     log: logging.Logger,
 ) -> None:
-    spool = Path(cfg.spool_dir)
-    if not spool.exists():
-        return
-    paths = sorted(p for p in spool.iterdir() if p.is_file() and p.suffix in {".log", ".jsonl", ".txt"})
-    for path in paths:
+    pending = await spool.iter_pending_uploads()
+    for handle, raw in pending:
         try:
-            raw_health = _read_health_raw(store)
+            raw_health = await store.read_health_raw()
             sophos_pull = dict(raw_health.get("last_successful_sophos_pull") or {})
-            sz = path.stat().st_size
+            sz = len(raw)
             t0 = time.perf_counter()
-            await taegis.upload_file(path, http)
+            fname = _taegis_basename(handle)
+            await taegis.upload_payload(fname, raw, http)
             dt = time.perf_counter() - t0
-            path.unlink(missing_ok=True)
+            await spool.remove(handle)
             slog(
                 log,
                 logging.INFO,
                 "taegis_upload_ok",
-                file=str(path),
+                file=handle,
                 upload_bytes=sz,
                 duration_seconds=round(dt, 3),
             )
-            store.write_health(
+            await store.write_health(
                 HealthState(
                     last_successful_sophos_pull=sophos_pull,
                     last_successful_taegis_upload=utc_now_ts(),
-                    spool_depth=spool_queue_depth(Path(cfg.spool_dir)),
+                    spool_depth=await spool.depth(),
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            slog(log, logging.ERROR, "taegis_upload_failed", file=str(path), error=str(exc))
+            slog(log, logging.ERROR, "taegis_upload_failed", file=handle, error=str(exc))
 
 
-async def run_cycle(cfg: CollectorConfig, log: logging.Logger) -> None:
-    store = StateStore(Path(cfg.state_dir))
+async def run_cycle(cfg: CollectorConfig, log: logging.Logger, *, use_s3: bool) -> None:
+    store, spool = build_async_persistence(cfg, use_s3=use_s3)
     sophos = SophosClient(cfg.retry)
     taegis = TaegisClient(cfg.taegis, cfg.retry)
     brk_cfg = CircuitBreakerConfig(
@@ -1115,7 +1406,7 @@ async def run_cycle(cfg: CollectorConfig, log: logging.Logger) -> None:
     )
     limits = httpx.Limits(max_connections=max(32, cfg.max_concurrent_estates * 4))
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0), limits=limits) as http:
-        await _upload_spool(cfg, taegis, http, store, log)
+        await _upload_spool(cfg, taegis, http, store, spool, log)
         sem = asyncio.Semaphore(cfg.max_concurrent_estates)
 
         async def guarded(est: SophosEstateConfig):
@@ -1137,20 +1428,20 @@ async def run_cycle(cfg: CollectorConfig, log: logging.Logger) -> None:
                 **{k: v for k, v in stats.items() if k != "breaker_transitions"},
             )
 
-        batcher = JsonlBatcher(Path(cfg.spool_dir), cfg.batching)
-        written: list[Path] = []
-        written.extend(batcher.extend(all_events))
-        written.extend(batcher.flush())
+        batcher = JsonlBatcher(spool, cfg.batching)
+        written: list[str] = []
+        written.extend(await batcher.extend(all_events))
+        written.extend(await batcher.flush())
 
-        raw_health = _read_health_raw(store)
+        raw_health = await store.read_health_raw()
         merged_pull = dict(raw_health.get("last_successful_sophos_pull") or {})
         merged_pull.update(estate_health)
         prev_upload = raw_health.get("last_successful_taegis_upload")
-        store.write_health(
+        await store.write_health(
             HealthState(
                 last_successful_sophos_pull=merged_pull,
                 last_successful_taegis_upload=float(prev_upload) if prev_upload is not None else None,
-                spool_depth=spool_queue_depth(Path(cfg.spool_dir)),
+                spool_depth=await spool.depth(),
             )
         )
 
@@ -1178,23 +1469,24 @@ async def run_cycle(cfg: CollectorConfig, log: logging.Logger) -> None:
             "cycle_batch_summary",
             events_total=len(all_events),
             spool_files_created=len(written),
-            spool_depth=spool_queue_depth(Path(cfg.spool_dir)),
+            spool_depth=await spool.depth(),
         )
-        await _upload_spool(cfg, taegis, http, store, log)
+        await _upload_spool(cfg, taegis, http, store, spool, log)
 
 
 async def loop_runner(cfg: CollectorConfig, log: logging.Logger) -> None:
     summary_every = cfg.observability.summary_interval_seconds
     next_summary = time.monotonic() + summary_every
+    local_spool = AsyncFileSpool(FileSpoolBackend(Path(cfg.spool_dir)))
     while True:
         t0 = time.monotonic()
         try:
-            await run_cycle(cfg, log)
+            await run_cycle(cfg, log, use_s3=False)
         except Exception as exc:  # noqa: BLE001
             log.error("cycle_failed", extra={"error": str(exc)}, exc_info=True)
         dt = time.perf_counter() - t0
         if time.monotonic() >= next_summary:
-            depth = spool_queue_depth(Path(cfg.spool_dir))
+            depth = await local_spool.depth()
             slog(
                 log,
                 logging.INFO,
@@ -1211,24 +1503,51 @@ async def loop_runner(cfg: CollectorConfig, log: logging.Logger) -> None:
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Multi-estate Sophos → Taegis collector")
     p.add_argument("--config", required=True, help="Path to JSON configuration file")
-    p.add_argument("--once", action="store_true", help="Run a single collection cycle and exit")
-    p.add_argument("--loop", action="store_true", help="Run forever with poll_interval_seconds sleep")
+    p.add_argument("--once", action="store_true", help="Run a single collection cycle and exit (local state/spool)")
+    p.add_argument("--loop", action="store_true", help="Run forever with poll_interval_seconds sleep (local state/spool)")
+    p.add_argument(
+        "--lambda",
+        dest="lambda_mode",
+        action="store_true",
+        help="Single cycle using S3 for state + spool (requires config `s3`). Also used as reference for AWS Lambda packaging.",
+    )
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)
     log = setup_logging(cfg.log_level)
 
-    if args.once and args.loop:
-        print("Choose only one of --once or --loop", file=sys.stderr)
-        raise SystemExit(2)
-    if not args.once and not args.loop:
-        print("Specify --once or --loop", file=sys.stderr)
+    modes = [bool(args.once), bool(args.loop), bool(args.lambda_mode)]
+    if sum(modes) != 1:
+        print("Specify exactly one of: --once, --loop, or --lambda", file=sys.stderr)
         raise SystemExit(2)
 
-    if args.once:
-        asyncio.run(run_cycle(cfg, log))
+    if args.lambda_mode:
+        if cfg.s3 is None:
+            print("When using --lambda, config must include an `s3` object with at least `bucket`.", file=sys.stderr)
+            raise SystemExit(2)
+        asyncio.run(run_cycle(cfg, log, use_s3=True))
+    elif args.once:
+        asyncio.run(run_cycle(cfg, log, use_s3=False))
     else:
         asyncio.run(loop_runner(cfg, log))
+
+
+def lambda_handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[str, Any]:
+    """AWS Lambda entrypoint. Set event['config_path'] or env MULTIESTATE_CONFIG / CONFIG_PATH to the JSON file path (or bundle config in deployment)."""
+    event = event or {}
+    path = event.get("config_path") or os.environ.get("MULTIESTATE_CONFIG") or os.environ.get("CONFIG_PATH")
+    if not path:
+        return {"ok": False, "error": "Missing config path: event['config_path'] or MULTIESTATE_CONFIG / CONFIG_PATH env"}
+    cfg = load_config(path)
+    if cfg.s3 is None:
+        return {"ok": False, "error": "Config must include `s3` (bucket, optional prefix) for Lambda persistence"}
+    log = setup_logging(cfg.log_level)
+    try:
+        asyncio.run(run_cycle(cfg, log, use_s3=True))
+    except Exception as exc:  # noqa: BLE001
+        log.error("lambda_handler_failed", extra={"error": str(exc)}, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
 
 
 if __name__ == "__main__":
