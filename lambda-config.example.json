@@ -1,0 +1,57 @@
+{
+  "sophos_estates": [
+    {
+      "name": "estate-example",
+      "tenant_id": "REPLACE_SOPHOS_TENANT_UUID",
+      "client_id": "REPLACE_SOPHOS_CLIENT_ID",
+      "client_secret": "REPLACE_SOPHOS_CLIENT_SECRET",
+      "data_region": "us03",
+      "exclude_types": [],
+      "min_request_interval_seconds": 1
+    }
+  ],
+  "poll_interval_seconds": 3600,
+  "max_concurrent_estates": 3,
+  "max_pages_per_estate_per_cycle": 50,
+  "initial_backfill_minutes": 120,
+  "behind_warning_minutes": 45,
+  "sophos_events_limit": 1000,
+  "taegis": {
+    "api_endpoint": "https://api.ctpx.secureworks.com",
+    "client_id": "REPLACE_TAEGIS_CLIENT_ID",
+    "client_secret": "REPLACE_TAEGIS_CLIENT_SECRET",
+    "tenant_id": "REPLACE_TAEGIS_TENANT_ID",
+    "auth_path": "/auth/api/v2/auth/token",
+    "s3_signer_path": "/s3-signer/v2/signed-s3url"
+  },
+  "output_format": "jsonl",
+  "batching": {
+    "max_events": 5000,
+    "max_bytes": 8000000,
+    "max_age_seconds": 300
+  },
+  "state_dir": "./var/state",
+  "spool_dir": "./var/spool",
+  "s3": {
+    "bucket": "your-collector-state-bucket",
+    "prefix": "multiestate/prod/",
+    "region": null
+  },
+  "circuit_breaker": {
+    "failures_to_open": 5,
+    "open_cooldown_seconds": 1800,
+    "half_open_max_calls": 2,
+    "half_open_successes_to_close": 2,
+    "failure_reset_window_seconds": 3600
+  },
+  "retry": {
+    "sophos_max_attempts": 6,
+    "taegis_max_attempts": 8,
+    "backoff_initial_seconds": 1,
+    "backoff_max_seconds": 120
+  },
+  "observability": {
+    "summary_interval_seconds": 900
+  },
+  "log_level": "INFO"
+}
