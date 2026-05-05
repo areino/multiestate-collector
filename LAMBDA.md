@@ -1,84 +1,60 @@
 # Deploying Multiestate Collector on AWS Lambda
 
-This guide walks through running **`multiestate_collector.lambda_handler`** on AWS Lambda with **Amazon S3** for state and spool persistence. For behavior details (key layout, IAM actions), see [README.md](README.md).
+This guide uses the **AWS Management Console** for creating resources and schedules. For behavior details (S3 key layout, IAM actions, config schema), see [README.md](README.md) and `examples/lambda-config.example.json`.
 
-**Assumptions:** You have an AWS account, permission to create S3 buckets, IAM roles, Lambda functions, and EventBridge rules. Replace placeholders such as `us-east-1`, `123456789012`, and bucket names with your own values.
+**Assumptions:** You can sign in to the correct AWS account and Region, and you have rights to create S3 buckets, IAM roles, Lambda functions, and EventBridge rules.
 
 ---
 
-## What gets deployed
+## What you will create
 
 | Component | Role |
 |-----------|------|
-| **S3 bucket** | Stores cursors, circuit breakers, `health.json`, and pending JSONL batches under a configurable prefix. |
-| **Lambda function** | Runs one collection cycle per invocation (`asyncio.run(run_cycle(..., use_s3=True))`). |
-| **EventBridge rule** | Invokes Lambda on a schedule (recommended; mirrors `poll_interval_seconds` in config). |
-| **IAM** | Lambda execution role: S3 access to your prefix and CloudWatch Logs. |
+| **S3 bucket** | Stores cursors, circuit breakers, `health.json`, and pending JSONL batches under your configured prefix. |
+| **IAM role** | Lets Lambda write logs and read/write objects under that bucket prefix. |
+| **Lambda function** | Runs **one** collection cycle per invocation (`multiestate_collector.lambda_handler`). |
+| **EventBridge rule** | Invokes Lambda on a schedule (aligned with `poll_interval_seconds` in your JSON). |
 
-The handler resolves the JSON config file from (first match):
-
-1. `event["config_path"]` (useful for EventBridge scheduled events), or  
-2. Environment variable **`MULTIESTATE_CONFIG`** or **`CONFIG_PATH`**.
-
-The JSON file **must** include an **`s3`** block (`bucket`, optional `prefix`, optional `region`). Optional **`MULTIESTATE_*`** environment variables overlay values from that file (nested keys use `__`; see `load_config` in `multiestate_collector.py`).
+**Config file:** The handler loads JSON from `event["config_path"]` **or** environment variables **`MULTIESTATE_CONFIG`** or **`CONFIG_PATH`**. The file **must** include an **`s3`** object (`bucket`, optional `prefix`, optional `region`). You may overlay secrets with **`MULTIESTATE_*`** env vars (nested keys use `__`; see `load_config` in `multiestate_collector.py`).
 
 ---
 
-## 1. Create the S3 bucket
+## 1. Create the S3 bucket (console)
 
-Use a **dedicated bucket** (or a dedicated prefix in a shared bucket) so lifecycle and IAM policies stay simple.
+Use a **dedicated bucket** so IAM stays straightforward.
 
-### AWS CLI
+1. Sign in to **AWS Management Console** → open **Amazon S3**.
+2. Choose **Buckets** → **Create bucket**.
+3. **Bucket name:** Globally unique name (for example `mycompany-multiestate-collector-state`).
+4. **AWS Region:** Pick the Region where you will run Lambda (same Region avoids cross-region latency and simplifies IAM).
+5. **Object Ownership:** Keep **ACLs disabled** unless your org requires otherwise.
+6. **Block Public Access settings for this bucket:** Leave **Block *all* public access** selected.
+7. **Bucket Versioning:** Optional — enable if you want to recover overwritten state files.
+8. **Default encryption:** Enable **Server-side encryption** with **Amazon S3 managed keys (SSE-S3)** (or KMS if your policy requires it).
+9. Choose **Create bucket**.
 
-```bash
-export REGION=us-east-1
-export BUCKET=my-org-multiestate-collector-state
-
-aws s3api create-bucket \
-  --bucket "$BUCKET" \
-  --region "$REGION" \
-  $( [ "$REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$REGION" )
-
-aws s3api put-public-access-block \
-  --bucket "$BUCKET" \
-  --public-access-block-configuration \
-    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
-aws s3api put-bucket-encryption \
-  --bucket "$BUCKET" \
-  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-```
-
-Optional: enable **versioning** if you want to recover overwritten state objects:
-
-```bash
-aws s3api put-bucket-versioning \
-  --bucket "$BUCKET" \
-  --versioning-configuration Status=Enabled
-```
-
-Note the bucket name and prefix you will put in **`s3.bucket`** and **`s3.prefix`** in the Lambda config JSON (see `examples/lambda-config.example.json`).
-
-### AWS Console
-
-1. Open **S3** → **Create bucket**.
-2. Choose the Region (must match Lambda unless you accept cross-region latency and complexity).
-3. Block all public access (default).
-4. Enable **Default encryption** (SSE-S3 or KMS).
-5. Create the bucket.
+**Write down** the bucket name and the **prefix** you will use in config (for example `multiestate/prod/`). You will put them in **`s3.bucket`** and **`s3.prefix`** in the JSON that Lambda loads.
 
 ---
 
-## 2. Create the Lambda function
+## 2. Create the Lambda execution role (console)
 
-### 2.1 Execution role (IAM)
+The function needs a role with **CloudWatch Logs** and **S3** access to your prefix.
 
-Create a role that **Lambda** can assume and attach:
+### 2.1 Create the role
 
-1. **Trust policy** (who can assume the role): AWS service `lambda.amazonaws.com`.
-2. **Permissions:**
-   - **`AWSLambdaBasicExecutionRole`** (managed policy) — CloudWatch Logs.
-   - **Inline policy** for your bucket and prefix (adjust `BUCKET` and `PREFIX` — use the prefix from config, with trailing path semantics; keys look like `multiestate/prod/state/...`):
+1. Open **IAM** → **Roles** → **Create role**.
+2. **Trusted entity type:** **AWS service**.
+3. **Use case:** **Lambda** → **Next**.
+4. **Add permissions —** search for and select **`AWSLambdaBasicExecutionRole`** (AWS managed). This allows writing to CloudWatch Logs.
+5. **Next.** Role name: for example `multiestate-collector-lambda`. **Create role**.
+
+### 2.2 Add S3 permissions for your bucket and prefix
+
+1. Open the role you just created → **Permissions** tab → **Add permissions** → **Create inline policy**.
+2. Choose the **JSON** tab and paste the policy below.
+3. Replace **`YOUR-BUCKET-NAME`** with your S3 bucket name.
+4. Replace **`YOUR-PREFIX`** with the prefix segment used in keys (no leading `/`; match what you set in **`s3.prefix`**, for example `multiestate/prod/`). The `*` after the prefix matches all objects under that path.
 
 ```json
 {
@@ -92,16 +68,16 @@ Create a role that **Lambda** can assume and attach:
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::BUCKET/PREFIX*"
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/YOUR-PREFIX*"
     },
     {
-      "Sid": "ListPrefix",
+      "Sid": "ListBucketForPrefix",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::BUCKET",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["PREFIX*"]
+          "s3:prefix": ["YOUR-PREFIX*"]
         }
       }
     }
@@ -109,172 +85,174 @@ Create a role that **Lambda** can assume and attach:
 }
 ```
 
-Replace `BUCKET` with your bucket name. Replace `PREFIX` with the normalized prefix (no leading slash; include the folder segment you use, e.g. `multiestate/prod/` — wildcards must match how your keys are stored).
+5. **Next** → Policy name: for example `multiestate-collector-s3` → **Create policy**.
 
-CLI example (after editing the policy file):
+If **`AccessDenied`** appears for **`ListBucket`** in CloudWatch Logs, broaden the second statement (some teams allow **`ListBucket`** on the bucket **without** the prefix condition for simplicity).
 
-```bash
-aws iam create-role --role-name multiestate-collector-lambda \
-  --assume-role-policy-document file://trust-lambda.json
+---
 
-aws iam attach-role-policy --role-name multiestate-collector-lambda \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+## 3. Build the deployment package (local — Windows and Linux)
 
-aws iam put-role-policy --role-name multiestate-collector-lambda \
-  --policy-name multiestate-s3-access \
-  --policy-document file://s3-inline-policy.json
+Lambda needs a **.zip** whose **root** contains **`multiestate_collector.py`** and installed dependencies (`httpx`, `pydantic`, `boto3` from `requirements.txt`). The zip must **not** add an extra parent folder above those files when Lambda unpacks it.
+
+**Recommendation:** These libraries are pure Python for typical installs; building on **Windows** often works. If the upload fails at import time or you use extensions that need Linux binaries, build inside **WSL2** (Ubuntu) or a Linux CI job using the same commands as **Linux** below.
+
+Prepare your config file (see `examples/lambda-config.example.json`): include **`s3.bucket`** and **`s3.prefix`** matching the bucket you created. Name it **`config.json`** when placing it in the package folder so you can set **`CONFIG_PATH=/var/task/config.json`** on Lambda.
+
+### Windows (PowerShell)
+
+From your project folder (where `requirements.txt` and `multiestate_collector.py` live):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+New-Item -ItemType Directory -Force -Path build\package | Out-Null
+pip install -r requirements.txt -t build\package\
+Copy-Item multiestate_collector.py build\package\
+Copy-Item path\to\your\config.json build\package\config.json
+
+Compress-Archive -Path build\package\* -DestinationPath build\function.zip -Force
 ```
 
-### 2.2 Deployment package
+- **`Compress-Archive`** puts the **contents** of `package` at the root of the zip (correct for Lambda).
+- If execution policy blocks scripts: run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or use **cmd** with `venv\Scripts\activate.bat`.
 
-The handler is **`multiestate_collector.lambda_handler`**, so the deployment artifact must include **`multiestate_collector.py`** at the **top level** of the zip (not nested under a parent folder when you upload).
-
-Dependencies (`requirements.txt`: `httpx`, `pydantic`, `boto3`) must be installed into the same zip root so imports resolve.
-
-**Build on Linux (recommended)** — matches the Lambda execution environment and avoids Windows-specific binary issues:
+### Linux or macOS (bash)
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
 mkdir -p build/package
 pip install -r requirements.txt -t build/package/
 cp multiestate_collector.py build/package/
-( cd build/package && zip -r ../function.zip . )
+cp path/to/your/config.json build/package/config.json
+
+(cd build/package && zip -r ../function.zip .)
 ```
 
-**Config in the zip:** Copy your real config (with `s3` filled in) into the package, e.g. `build/package/config.json`, then zip. At runtime set **`CONFIG_PATH=/var/task/config.json`** (or **`MULTIESTATE_CONFIG=/var/task/config.json`**) on the function. Prefer **not** committing secrets: keep a minimal JSON in the zip and inject secrets via **`MULTIESTATE_TAEGIS__CLIENT_SECRET`**-style env vars.
-
-### 2.3 Create the function (CLI)
-
-Pick a runtime that matches your local testing (e.g. **Python 3.12**).
-
-```bash
-aws lambda create-function \
-  --function-name multiestate-collector \
-  --runtime python3.12 \
-  --role arn:aws:iam::123456789012:role/multiestate-collector-lambda \
-  --handler multiestate_collector.lambda_handler \
-  --zip-file fileb://build/function.zip \
-  --timeout 900 \
-  --memory-size 512 \
-  --environment "Variables={CONFIG_PATH=/var/task/config.json}" \
-  --region "$REGION"
-```
-
-**Timeout:** One run is a **full cycle** (Sophos pull, batching, Taegis uploads). Start with **5–15 minutes**; increase toward **900 seconds** if many estates or large backlogs cause timeouts.
-
-**Memory:** More memory increases CPU proportionally; adjust after you see cold-start and cycle duration in CloudWatch.
-
-### 2.4 Create the function (Console)
-
-1. **Lambda** → **Create function** → Author from scratch.  
-2. Runtime: **Python 3.11** or **3.12**. Architecture: **x86_64** unless you built arm64 wheels.  
-3. Execution role: use the role created above.  
-4. After creation: **Code** → **Upload from** → **.zip file** → upload `function.zip`.  
-5. **Runtime settings** → **Handler** → `multiestate_collector.lambda_handler`.  
-6. **Configuration** → **Environment variables**: set **`CONFIG_PATH`** or **`MULTIESTATE_CONFIG`** to `/var/task/config.json` if the config is inside the zip.  
-7. **Configuration** → **General configuration**: set **Timeout** and **Memory** as above.
+You should now have **`build/function.zip`**.
 
 ---
 
-## 3. Schedule the function (EventBridge)
+## 4. Create the Lambda function (console)
 
-Lambda is **event-driven**: each invocation runs **one** cycle. Schedule should align with **`poll_interval_seconds`** in your JSON (e.g. hourly → rule every hour).
+1. Open **AWS Lambda** → **Create function**.
+2. **Author from scratch.**  
+   - **Function name:** for example `multiestate-collector`.  
+   - **Runtime:** **Python 3.12** or **Python 3.11** (match what you use locally).  
+   - **Architecture:** **x86_64** unless you intentionally build for **arm64**.  
+   - Expand **Change default execution role** → **Use an existing role** → select **`multiestate-collector-lambda`** (or the role name you created).
+3. **Create function.**
 
-### EventBridge rule invoking Lambda (CLI)
+### 4.1 Upload code
 
-**Rate expression** (every hour):
+1. Open the function → **Code** tab.
+2. **Upload from** → **.zip file** → upload **`build/function.zip`** → **Save**.
 
-```bash
-aws events put-rule \
-  --name multiestate-collector-hourly \
-  --schedule-expression "rate(1 hour)" \
-  --state ENABLED \
-  --region "$REGION"
+### 4.2 Runtime settings
 
-aws lambda add-permission \
-  --function-name multiestate-collector \
-  --statement-id AllowEventBridgeInvoke \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com \
-  --source-arn arn:aws:events:$REGION:123456789012:rule/multiestate-collector-hourly
+1. **Configuration** → **Runtime settings** → **Edit**.  
+2. **Handler:** `multiestate_collector.lambda_handler`  
+3. Save.
 
-aws events put-targets \
-  --rule multiestate-collector-hourly \
-  --targets "Id"="1","Arn"="arn:aws:lambda:$REGION:123456789012:function:multiestate-collector","Input"='{"config_path":"/var/task/config.json"}'
-```
+### 4.3 Environment variables
 
-Use **`Input`** (or **Input transformer**) so **`config_path`** is set when you rely on `event["config_path"]`. If you only use **`CONFIG_PATH`** env, a constant **`{}`** input is fine.
+1. **Configuration** → **Environment variables** → **Edit** → **Add environment variable**.  
+2. Add **`CONFIG_PATH`** = **`/var/task/config.json`** if **`config.json`** is in the zip root (alternatively use **`MULTIESTATE_CONFIG`** with the same value).  
+3. Optionally add **`MULTIESTATE_TAEGIS__CLIENT_SECRET`** (and other **`MULTIESTATE_*`** keys) to override secrets without editing the zip. Save.
 
-**Cron expression** (weekdays at minute 0 past each hour UTC):
+### 4.4 Memory and timeout
 
-```bash
-aws events put-rule \
-  --name multiestate-collector-weekday-hourly \
-  --schedule-expression "cron(0 * ? * MON-FRI *)" \
-  --state ENABLED
-```
+1. **Configuration** → **General configuration** → **Edit**.  
+2. **Timeout:** One invocation runs a **full** cycle (Sophos → batch → Taegis). Start with **5 minutes (300 s)** and increase toward **15 minutes (900 s)** if CloudWatch shows timeouts.  
+3. **Memory:** Start with **512 MB**; raise if **Duration** is high or you need more CPU (Lambda scales CPU with memory).
 
-### Console
-
-1. **Amazon EventBridge** → **Rules** → **Create rule**.  
-2. **Schedule pattern** → define rate or cron.  
-3. **Target** → **AWS Lambda** → select **`multiestate-collector`**.  
-4. Under **Configure target**, set **Additional configuration** → **Configure input** → **Constant (JSON text)** → e.g. `{"config_path":"/var/task/config.json"}`.  
-5. Create the rule; accept the prompt to add **invoke permission** for EventBridge on the Lambda function.
+Save. Then **Deploy** if the console shows unsaved code changes.
 
 ---
 
-## 4. Monitor and troubleshoot
+## 5. Schedule the function (EventBridge — console)
 
-### 4.1 CloudWatch Logs
+Each scheduled run should execute **one** cycle. Match the rule’s interval to **`poll_interval_seconds`** in your config (for example hourly → **rate(1 hour)**).
 
-Each invocation writes to a **log group** named **`/aws/lambda/multiestate-collector`** (unless renamed). Search for:
+1. Open **Amazon EventBridge** → **Rules** → **Create rule**.
+2. **Name:** for example `multiestate-collector-hourly`.  
+3. **Rule type:** **Schedule**.  
+4. **Schedule pattern:**  
+   - **A schedule that runs at a regular rate**, e.g. every **1 hour**, **or**  
+   - **Cron expression** for finer control (times are **UTC**).
+5. **Next** → **Select targets** → **Target type:** **AWS service** → **Lambda function** → choose **`multiestate-collector`**.
+6. Expand **Additional settings**. Under **Configure target**:  
+   - **Configure version / alias:** leave **$LATEST** unless you use aliases.  
+   - **Configure execution role:** EventBridge may create or reuse a role to invoke Lambda — accept the default prompt if offered.
+7. **Configure input:** choose **Constant (JSON text)** and enter:
 
-- **`lambda_handler_failed`** — exception during the cycle; stack trace in the same log entry.
-- **`cycle_failed`** — cycle-level failure (if logged before handler exit).
-- **`ERROR`** level lines from configured `log_level`.
+   `{"config_path":"/var/task/config.json"}`
 
-**Tips:**
+   (Use the same path as your packaged **`config.json`**. If you rely only on **`CONFIG_PATH`** env and do not read **`event["config_path"]`**, you can use `{}`.)
 
-- Enable **CloudWatch Logs Insights** queries, e.g. filter `@message like /ERROR/` over the last 24 hours.
-- If logs never appear, confirm the execution role has **`logs:CreateLogGroup`**, **`logs:CreateLogStream`**, **`logs:PutLogEvents`** (via `AWSLambdaBasicExecutionRole`).
+8. **Next** → review → **Create rule**.  
+9. If the console asks to **add permission** for EventBridge to invoke your Lambda, **approve** it.
 
-### 4.2 Lambda metrics and alarms
+To confirm the rule: **EventBridge** → **Rules** → select the rule → verify **State** is **Enabled** and the target ARN points at your function.
 
-In **CloudWatch** → **Metrics** → **Lambda**:
+---
 
-| Metric | Use |
-|--------|-----|
-| **Invocations** | Confirms the schedule is firing. |
-| **Errors** | Non-zero indicates thrown exceptions or runtime failures. |
-| **Duration** | Compare to **Timeout**; increase timeout or memory if near limit. |
-| **Throttles** | Account concurrency limits; request increase if needed. |
+## 6. Monitor and troubleshoot (console)
 
-Create **alarms** on **Errors > 0** or **Duration > threshold** for proactive paging.
+### 6.1 CloudWatch Logs
 
-### 4.3 S3 state and health
+1. Open **CloudWatch** → **Log groups**.  
+2. Open **`/aws/lambda/multiestate-collector`** (name matches your function).  
+3. Open the latest **log stream** after a scheduled run.
 
-Inspect objects under your prefix:
+Search the log messages for:
 
-- **`{prefix}state/health.json`** — last successful Sophos pull timestamps, last Taegis upload, spool depth.
-- **`{prefix}state/cursors/*.json`** — cursor progression per estate.
-- **`{prefix}spool/*.log`** — if these accumulate, Taegis upload may be failing or throttled; check logs and Taegis credentials.
+- **`lambda_handler_failed`** — uncaught exception; stack trace should follow.  
+- **`cycle_failed`** — cycle-level failure.  
+- **`ERROR`** — matches your configured **`log_level`**.
 
-### 4.4 Common issues
+**Logs Insights:** **CloudWatch** → **Logs Insights** → select the Lambda log group → run a query such as filtering for `ERROR` over the last day.
 
-| Symptom | Things to check |
-|---------|------------------|
-| Return value `{"ok": false, "error": "Missing config path..."}` | Set **`event.config_path`** on the schedule target or **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`** env to a path that exists in the zip (e.g. `/var/task/config.json`). |
-| Return value mentions **`s3`** | Config JSON must include **`s3.bucket`** (and optional **`prefix`**) for Lambda mode. |
-| **AccessDenied** on S3 | IAM policy **Resource** / **prefix** conditions must cover actual keys; verify bucket name and prefix string. |
-| **Timeout** | Increase Lambda timeout; reduce **`max_pages_per_estate_per_cycle`** or estates per function; split estates across functions if needed. |
-| **SSL / connection errors** to Sophos or Taegis | Lambda must have **internet egress** (default when not in a VPC); if using a VPC, add **NAT Gateway** or VPC endpoints as appropriate. |
-| Works locally with **`--lambda`**, fails on Lambda | Compare region, IAM, and exact **`s3`** settings; confirm deployment zip layout and handler string. |
+If **no log group** appears after an invocation, confirm the role includes **`AWSLambdaBasicExecutionRole`** and that the function actually ran (**Lambda** → **Monitor** → **Invocations**).
 
-### 4.5 Optional hardening
+### 6.2 Lambda metrics and alarms
 
-- **Dead-letter queue (DLQ)** on async invocation configuration for failures (more relevant for async patterns).  
-- **AWS X-Ray** if you add tracing downstream.  
-- **Secrets Manager** or **SSM Parameter Store** for secrets; you can resolve secrets into env vars at deploy time or extend the loader (today the script reads JSON + **`MULTIESTATE_*`** overrides).
+1. **Lambda** → your function → **Monitor** tab — charts for **Invocations**, **Duration**, **Errors**, **Throttles**.  
+2. **CloudWatch** → **Alarms** → **Create alarm** → choose **Lambda** metrics → alarm on **Errors ≥ 1** or **Duration** near your timeout.
+
+| Metric | What it tells you |
+|--------|-------------------|
+| **Invocations** | Schedule (or manual test) is firing. |
+| **Errors** | Exceptions or failed handler execution. |
+| **Duration** | Compare to **Timeout** in configuration. |
+| **Throttles** | Concurrency limits; rare for a single scheduled job unless the account is constrained. |
+
+### 6.3 S3 health and spool (console)
+
+1. **S3** → your bucket → browse under your prefix.  
+2. Check **`…/state/health.json`** — timestamps for Sophos pulls and Taegis upload, **spool_depth**.  
+3. **`…/state/cursors/`** — cursor JSON per estate.  
+4. **`…/spool/`** — `*.log` batches. Growth without shrinking after runs suggests Taegis upload or credential issues; correlate with CloudWatch errors.
+
+### 6.4 Common issues
+
+| Symptom | What to check in the console |
+|---------|------------------------------|
+| Handler returns **`Missing config path`** | **Lambda** → **Configuration** → **Environment variables**: **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`**, or EventBridge target **Constant JSON** with **`config_path`**. Ensure the path matches a file **inside the zip** (typically **`/var/task/config.json`**). |
+| Error about **`s3`** in the response | Edit **`config.json`** (re-upload zip) or env overrides so **`s3.bucket`** (and **`prefix`**) is present. |
+| **AccessDenied** on S3 | **IAM** → role → inline policy: bucket name, **`Resource`** ARNs, and **`s3:prefix`** condition match real object keys. |
+| **Task timed out** after **Duration** ≈ timeout | **Lambda** → **Configuration** → increase **Timeout**; tune **`max_pages_per_estate_per_cycle`** in config; consider splitting estates across functions. |
+| Network / SSL errors to Sophos or Taegis | Default Lambda has internet access when **not** in a VPC. If you attached a **VPC**, ensure **NAT Gateway** or endpoints allow HTTPS egress. |
+| Works on PC with **`python multiestate_collector.py --config … --lambda`**, fails in Lambda | Same **Region**, **IAM**, and **`s3`** settings; **zip** layout (handler at top level); **Handler** string exactly **`multiestate_collector.lambda_handler`**. |
+
+### 6.5 Manual test (console)
+
+**Lambda** → **Test** tab → create an event with JSON **`{"config_path":"/var/task/config.json"}`** (or `{}` if using env only) → **Test**. Inspect **Execution result** and CloudWatch Logs.
 
 ---
 
@@ -283,12 +261,18 @@ Inspect objects under your prefix:
 | Item | Value |
 |------|--------|
 | Handler | `multiestate_collector.lambda_handler` |
-| Config path | `event["config_path"]` or env **`MULTIESTATE_CONFIG`** / **`CONFIG_PATH`** |
-| Config requirements | Valid collector JSON + **`s3`** block |
-| Scheduled payload | e.g. `{"config_path":"/var/task/config.json"}` |
+| Config | **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`**, or **`event["config_path"]`** |
+| Config JSON | Must include **`s3`** (`bucket`, optional `prefix`, optional `region`) |
+| Config inside zip | Often **`/var/task/config.json`** |
 
-For local testing against S3 before deploying:
+**Local test (Windows PowerShell, after venv activate):**
+
+```powershell
+python multiestate_collector.py --config path\to\config-with-s3.json --lambda
+```
+
+**Local test (Linux/macOS):**
 
 ```bash
-python multiestate_collector.py --config your-config-with-s3.json --lambda
+python multiestate_collector.py --config path/to/config-with-s3.json --lambda
 ```
