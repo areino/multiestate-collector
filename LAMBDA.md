@@ -15,7 +15,7 @@ This guide uses the **AWS Management Console** for creating resources and schedu
 | **Lambda function** | Runs **one** collection cycle per invocation (`multiestate_collector.lambda_handler`). |
 | **EventBridge rule** | Invokes Lambda on a schedule (aligned with `poll_interval_seconds` in your JSON). |
 
-**Config file:** The handler loads JSON from `event["config_path"]` **or** environment variables **`MULTIESTATE_CONFIG`** or **`CONFIG_PATH`**. The file **must** include an **`s3`** object (`bucket`, optional `prefix`, optional `region`). You may overlay secrets with **`MULTIESTATE_*`** env vars (nested keys use `__`; see `load_config` in `multiestate_collector.py`).
+**Config:** The handler loads JSON in this order: environment **`MULTIESTATE_CONFIG_JSON`** (full JSON inline; env size limits apply), **or** a file path from **`event["config_path"]`** / **`MULTIESTATE_CONFIG`** / **`CONFIG_PATH`**. The JSON **must** include an **`s3`** object (`bucket`, optional `prefix`, optional `region`). You may overlay secrets with **`MULTIESTATE_*`** env vars (nested keys use `__`; see `load_config_dict` in `multiestate_collector.py`).
 
 ---
 
@@ -51,10 +51,39 @@ The function needs a role with **CloudWatch Logs** and **S3** access to your pre
 
 ### 2.2 Add S3 permissions for your bucket and prefix
 
-1. Open the role you just created → **Permissions** tab → **Add permissions** → **Create inline policy**.
-2. Choose the **JSON** tab and paste the policy below.
-3. Replace **`YOUR-BUCKET-NAME`** with your S3 bucket name.
-4. Replace **`YOUR-PREFIX`** with the prefix segment used in keys (no leading `/`; match what you set in **`s3.prefix`**, for example `multiestate/prod/`). The `*` after the prefix matches all objects under that path.
+The collector calls **`ListObjectsV2`** for the spool prefix (uploads, depth, listing pending files). That API requires **`s3:ListBucket`** on the **bucket** ARN. Object-only policies (`…/*` without `ListBucket`) will fail with **AccessDenied** on `ListObjectsV2`.
+
+1. Open the role you just created → **Permissions** tab → **Add permissions** → **Create inline policy** (or edit the existing S3 policy).
+2. Choose the **JSON** tab and use one of the options below.
+3. Replace **`YOUR-BUCKET-NAME`** with your S3 bucket name (e.g. `multiestate-collector-s3`).
+
+**Option A — Simple (recommended to get running)** — list and read/write any object in this bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME"
+    },
+    {
+      "Sid": "ObjectReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+    }
+  ]
+}
+```
+
+**Option B — Prefix-scoped objects** — limits **`GetObject`/`PutObject`/`DeleteObject`** to keys under your prefix; **`ListBucket`** must still be allowed, and any **`s3:prefix`** condition must cover **every** prefix the app uses (including **`…/state/`** and **`…/spool/`** — see README key layout). If in doubt, use Option A or **`ListBucket`** without a prefix condition.
 
 ```json
 {
@@ -71,7 +100,7 @@ The function needs a role with **CloudWatch Logs** and **S3** access to your pre
       "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/YOUR-PREFIX*"
     },
     {
-      "Sid": "ListBucketForPrefix",
+      "Sid": "ListBucket",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME",
@@ -85,56 +114,85 @@ The function needs a role with **CloudWatch Logs** and **S3** access to your pre
 }
 ```
 
-5. **Next** → Policy name: for example `multiestate-collector-s3` → **Create policy**.
+4. **Next** → Policy name: for example `multiestate-collector-s3` → **Create policy**.
 
-If **`AccessDenied`** appears for **`ListBucket`** in CloudWatch Logs, broaden the second statement (some teams allow **`ListBucket`** on the bucket **without** the prefix condition for simplicity).
+If you still see **`AccessDenied`** on **`ListObjectsV2`**, switch **`ListBucket`** to **no** `Condition` block (Option A pattern), or widen **`s3:prefix`** so it matches the configured **`s3.prefix`** plus **`state/`** and **`spool/`** segments.
 
 ---
 
-## 3. Build the deployment package (local — Windows and Linux)
+## 3. Build the deployment package (required: Docker)
 
-Lambda needs a **.zip** whose **root** contains **`multiestate_collector.py`** and installed dependencies (`httpx`, `pydantic`, `boto3` from `requirements.txt`). The zip must **not** add an extra parent folder above those files when Lambda unpacks it.
+Lambda runs **Amazon Linux**. **`pydantic`** depends on **`pydantic_core`**, which ships **native binaries**. If you run `pip install -r requirements.txt -t …` on **Windows**, you get Windows `.pyd` files. Lambda then fails with:
 
-**Recommendation:** These libraries are pure Python for typical installs; building on **Windows** often works. If the upload fails at import time or you use extensions that need Linux binaries, build inside **WSL2** (Ubuntu) or a Linux CI job using the same commands as **Linux** below.
+`Runtime.ImportModuleError: No module named 'pydantic_core._pydantic_core'`
 
-Prepare your config file (see `examples/lambda-config.example.json`): include **`s3.bucket`** and **`s3.prefix`** matching the bucket you created. Name it **`config.json`** when placing it in the package folder so you can set **`CONFIG_PATH=/var/task/config.json`** on Lambda.
+**Always build the zip using the official Lambda Python base image** (same OS and ABI as production). The repo includes scripts that run **`pip install`** inside **`public.ecr.aws/lambda/python`** so wheels match Lambda.
 
-### Windows (PowerShell)
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows or macOS) or Docker on Linux, running before you execute the script.
 
-From your project folder (where `requirements.txt` and `multiestate_collector.py` live):
+### Option A — Scripts (recommended)
+
+From the **repository root**:
+
+**Windows (PowerShell):**
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-New-Item -ItemType Directory -Force -Path build\package | Out-Null
-pip install -r requirements.txt -t build\package\
-Copy-Item multiestate_collector.py build\package\
-Copy-Item path\to\your\config.json build\package\config.json
-
-Compress-Archive -Path build\package\* -DestinationPath build\function.zip -Force
+.\scripts\package-lambda.ps1
 ```
 
-- **`Compress-Archive`** puts the **contents** of `package` at the root of the zip (correct for Lambda).
-- If execution policy blocks scripts: run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or use **cmd** with `venv\Scripts\activate.bat`.
+Optional: bundle `config.json` into the zip:
 
-### Linux or macOS (bash)
+```powershell
+.\scripts\package-lambda.ps1 -ConfigPath .\my-lambda-config.json
+```
+
+If your Lambda function uses **arm64**:
+
+```powershell
+.\scripts\package-lambda.ps1 -Arm64
+```
+
+The scripts mount your repo into **`public.ecr.aws/lambda/python`**, install dependencies there (Linux wheels), and write **`build/function.zip`** using Python’s **`zipfile`** inside the container so you avoid Docker-on-Windows permission quirks.
+
+**Linux or macOS (bash):**
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-mkdir -p build/package
-pip install -r requirements.txt -t build/package/
-cp multiestate_collector.py build/package/
-cp path/to/your/config.json build/package/config.json
-
-(cd build/package && zip -r ../function.zip .)
+chmod +x scripts/package-lambda.sh scripts/docker-pack-inner.sh   # once
+./scripts/package-lambda.sh
 ```
 
-You should now have **`build/function.zip`**.
+Optional:
+
+```bash
+CONFIG_PATH=./my-lambda-config.json RUNTIME=3.12 ARCH=x86_64 ./scripts/package-lambda.sh
+ARCH=arm64 ./scripts/package-lambda.sh
+```
+
+Each run creates a new folder **`build/package-<timestamp>/`** (older runs are not deleted automatically because Docker Desktop on Windows sometimes blocks removing prior **`pip -t`** trees on the bind-mounted volume). You can delete **`build\package-*`** or the whole **`build`** folder periodically when disk space matters.
+
+Under the hood both wrappers call **`scripts/docker-pack-inner.sh`** inside the container.
+
+Output artifact: **`build/function.zip`**. Upload it in the Lambda console (**Code** → **Upload from** → **.zip file**).
+
+### Option B — One Docker command
+
+Same as the scripts, without PowerShell (from repo root; **PowerShell** or **bash**):
+
+```text
+docker run --rm --entrypoint /bin/bash -v "%CD%:/workspace" -w /workspace public.ecr.aws/lambda/python:3.12 /workspace/scripts/docker-pack-inner.sh
+```
+
+(On PowerShell, **`${PWD}`** or an explicit path works instead of **`%CD%`**.)
+
+Staging **`build/_lambda_config.json`** before this command (optional) bundles **`config.json`** into the zip; the inner script copies it when present.
+
+### After building — quick sanity checks
+
+Expand **`build/function.zip`** locally and confirm the **root** of the archive contains **`multiestate_collector.py`**, folders like **`httpx`**, **`pydantic`**, **`pydantic_core`**, **`boto3`**, etc. There must **not** be a single top-level folder wrapping everything (Lambda expects the handler module at the zip root).
+
+### Match Lambda settings
+
+In the Lambda console, set **Runtime** (e.g. Python **3.12**) and **Architecture** (**x86_64** vs **arm64**) to match the image you used when building **`function.zip`**.
 
 ---
 
@@ -162,8 +220,9 @@ You should now have **`build/function.zip`**.
 ### 4.3 Environment variables
 
 1. **Configuration** → **Environment variables** → **Edit** → **Add environment variable**.  
-2. Add **`CONFIG_PATH`** = **`/var/task/config.json`** if **`config.json`** is in the zip root (alternatively use **`MULTIESTATE_CONFIG`** with the same value).  
-3. Optionally add **`MULTIESTATE_TAEGIS__CLIENT_SECRET`** (and other **`MULTIESTATE_*`** keys) to override secrets without editing the zip. Save.
+2. **Option A (file in zip):** Add **`CONFIG_PATH`** = **`/var/task/config.json`** (or **`MULTIESTATE_CONFIG`** with the same value). Rebuild the deployment zip with **`.\scripts\package-lambda.ps1 -ConfigPath .\your-config.json`** so that file exists on Lambda.  
+3. **Option B (no file):** Add **`MULTIESTATE_CONFIG_JSON`** with the **entire** config as a single-line JSON string (keep under combined Lambda env size limits, typically 4 KB for the full env block). **Remove** **`CONFIG_PATH`** if you use this, so the handler does not look for a missing file.  
+4. Optionally add **`MULTIESTATE_TAEGIS__CLIENT_SECRET`** (and other **`MULTIESTATE_*`** keys) to override fields from the JSON. Save.
 
 ### 4.4 Memory and timeout
 
@@ -243,9 +302,12 @@ If **no log group** appears after an invocation, confirm the role includes **`AW
 
 | Symptom | What to check in the console |
 |---------|------------------------------|
-| Handler returns **`Missing config path`** | **Lambda** → **Configuration** → **Environment variables**: **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`**, or EventBridge target **Constant JSON** with **`config_path`**. Ensure the path matches a file **inside the zip** (typically **`/var/task/config.json`**). |
+| **`ImportModuleError`** / **`pydantic_core._pydantic_core`** | Rebuild **`function.zip`** inside Docker (`scripts/package-lambda.ps1` or **`public.ecr.aws/lambda/python`**). Do not use Windows **`pip install -t`** for the Lambda artifact. Match **Runtime** and **Architecture** to the build image. |
+| **`ImportModuleError`** / **`httpx`** (or other deps missing) | Same as above: zip root must include dependency folders from **`pip install -t`**. Re-run the packaging script; confirm **`Compress-Archive`** / **`zip`** adds **`package\*`** contents at the **top level** of **`function.zip`**, not nested under another folder. |
+| Handler returns error about **missing** or **not found** config | Set **`CONFIG_PATH=/var/task/config.json`** only after bundling **`config.json`** in the zip (`.\scripts\package-lambda.ps1 -ConfigPath .\your-config.json`), **or** use **`MULTIESTATE_CONFIG_JSON`** and remove **`CONFIG_PATH`**, **or** set EventBridge **Constant JSON** `{"config_path":"/var/task/config.json"}` with a file that exists in the zip. |
 | Error about **`s3`** in the response | Edit **`config.json`** (re-upload zip) or env overrides so **`s3.bucket`** (and **`prefix`**) is present. |
-| **AccessDenied** on S3 | **IAM** → role → inline policy: bucket name, **`Resource`** ARNs, and **`s3:prefix`** condition match real object keys. |
+| **AccessDenied** on **`ListObjectsV2`** / **`s3:ListBucket`** | The execution role must allow **`s3:ListBucket`** on **`arn:aws:s3:::your-bucket-name`** (bucket ARN, not `/*`). Add or fix the inline policy (see §2.2 Option A). Prefix **`Condition`** keys are easy to get wrong—use Option A if unsure. |
+| **AccessDenied** on S3 objects | IAM **`Resource`** for objects must include **`arn:aws:s3:::bucket/prefix*`** (or **`…/*`**). Verify **`s3.prefix`** in config matches your policy. |
 | **Task timed out** after **Duration** ≈ timeout | **Lambda** → **Configuration** → increase **Timeout**; tune **`max_pages_per_estate_per_cycle`** in config; consider splitting estates across functions. |
 | Network / SSL errors to Sophos or Taegis | Default Lambda has internet access when **not** in a VPC. If you attached a **VPC**, ensure **NAT Gateway** or endpoints allow HTTPS egress. |
 | Works on PC with **`python multiestate_collector.py --config … --lambda`**, fails in Lambda | Same **Region**, **IAM**, and **`s3`** settings; **zip** layout (handler at top level); **Handler** string exactly **`multiestate_collector.lambda_handler`**. |
@@ -261,7 +323,7 @@ If **no log group** appears after an invocation, confirm the role includes **`AW
 | Item | Value |
 |------|--------|
 | Handler | `multiestate_collector.lambda_handler` |
-| Config | **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`**, or **`event["config_path"]`** |
+| Config | **`MULTIESTATE_CONFIG_JSON`**, or **`CONFIG_PATH`** / **`MULTIESTATE_CONFIG`**, or **`event["config_path"]`** |
 | Config JSON | Must include **`s3`** (`bucket`, optional `prefix`, optional `region`) |
 | Config inside zip | Often **`/var/task/config.json`** |
 

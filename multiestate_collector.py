@@ -27,7 +27,7 @@ from typing import Any, Iterable, TypeVar
 from urllib.parse import urlencode
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 T = TypeVar("T")
 
@@ -438,9 +438,9 @@ def _coerce_env_value(val: str) -> Any:
         return val
 
 
-def load_config(path: str | Path, env_os: dict[str, str] | None = None) -> CollectorConfig:
+def load_config_dict(raw: dict[str, Any], env_os: dict[str, str] | None = None) -> CollectorConfig:
+    """Merge MULTIESTATE_* env overrides into raw JSON and validate."""
     env_os = env_os if env_os is not None else os.environ
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
     prefix = "MULTIESTATE_"
     overrides: dict[str, Any] = {}
     for k, v in env_os.items():
@@ -453,6 +453,11 @@ def load_config(path: str | Path, env_os: dict[str, str] | None = None) -> Colle
         _nested_set(overrides, keys, _coerce_env_value(v))
     merged = _deep_merge(raw, overrides)
     return CollectorConfig.model_validate(merged)
+
+
+def load_config(path: str | Path, env_os: dict[str, str] | None = None) -> CollectorConfig:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return load_config_dict(raw, env_os)
 
 
 # ---------------------------------------------------------------------------
@@ -1533,12 +1538,39 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def lambda_handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[str, Any]:
-    """AWS Lambda entrypoint. Set event['config_path'] or env MULTIESTATE_CONFIG / CONFIG_PATH to the JSON file path (or bundle config in deployment)."""
+    """AWS Lambda entrypoint.
+
+    Config sources (first match):
+    - Env ``MULTIESTATE_CONFIG_JSON``: full JSON object (use when not bundling a file; size limit applies).
+    - ``event['config_path']`` or env ``MULTIESTATE_CONFIG`` / ``CONFIG_PATH``: path to a file on disk (e.g. ``/var/task/config.json`` if packaged in the zip).
+    """
     event = event or {}
-    path = event.get("config_path") or os.environ.get("MULTIESTATE_CONFIG") or os.environ.get("CONFIG_PATH")
-    if not path:
-        return {"ok": False, "error": "Missing config path: event['config_path'] or MULTIESTATE_CONFIG / CONFIG_PATH env"}
-    cfg = load_config(path)
+    raw_json = (os.environ.get("MULTIESTATE_CONFIG_JSON") or "").strip()
+    if raw_json:
+        try:
+            cfg = load_config_dict(json.loads(raw_json))
+        except json.JSONDecodeError as exc:
+            return {"ok": False, "error": f"Invalid MULTIESTATE_CONFIG_JSON: {exc}"}
+        except ValidationError as exc:
+            return {"ok": False, "error": f"Invalid config in MULTIESTATE_CONFIG_JSON: {exc}"}
+    else:
+        path = event.get("config_path") or os.environ.get("MULTIESTATE_CONFIG") or os.environ.get("CONFIG_PATH")
+        if not path:
+            return {
+                "ok": False,
+                "error": "Missing config: set MULTIESTATE_CONFIG_JSON, or event['config_path'], or MULTIESTATE_CONFIG / CONFIG_PATH",
+            }
+        p = Path(path)
+        if not p.is_file():
+            return {
+                "ok": False,
+                "error": (
+                    f"Config file not found: {path}. Rebuild the zip with "
+                    "`scripts/package-lambda.ps1 -ConfigPath your-config.json`, or remove CONFIG_PATH and use "
+                    "MULTIESTATE_CONFIG_JSON."
+                ),
+            }
+        cfg = load_config(path)
     if cfg.s3 is None:
         return {"ok": False, "error": "Config must include `s3` (bucket, optional prefix) for Lambda persistence"}
     log = setup_logging(cfg.log_level)

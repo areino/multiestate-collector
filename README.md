@@ -44,7 +44,7 @@ python multiestate_collector.py --config path\to\config-with-s3.json --lambda
 ## AWS Lambda
 
 - **Handler:** `multiestate_collector.lambda_handler`
-- **Config path:** set `event["config_path"]`, or environment variable **`MULTIESTATE_CONFIG`** or **`CONFIG_PATH`** to the JSON file on the Lambda filesystem (e.g. baked into the deployment zip or mounted from EFS).
+- **Config:** optional env **`MULTIESTATE_CONFIG_JSON`** (full JSON), **or** **`event["config_path"]`** / **`MULTIESTATE_CONFIG`** / **`CONFIG_PATH`** for a file path on Lambda (e.g. **`config.json`** packaged with `scripts/package-lambda.ps1 -ConfigPath …`).
 - **Persistence:** the config **must** include an **`s3`** object (`bucket`, optional `prefix`, optional `region`). Cursors, circuit breakers, `health.json`, and pending JSONL batches are stored under that bucket; `state_dir` / `spool_dir` are not used when `use_s3` is true.
 
 **S3 key layout** (prefix is normalized to a single trailing slash; default in schema is `multiestate/`):
